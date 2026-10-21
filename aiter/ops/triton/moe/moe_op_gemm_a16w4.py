@@ -331,6 +331,12 @@ def get_kernel_config_gluon_gfx942(m, n, k, routing_data):
     }
 
 
+# AITER_A16W4_GFX942_W_LDS=1 stages the fp4 weight tile through LDS with coalesced global loads
+# (2 columns x 128 B per quarter-wave); default loads it straight into the operand layout
+# (16 columns x 16 B per quarter-wave). Experimental switch, pending A/B on hardware.
+_GFX942_W_VIA_LDS = os.environ.get("AITER_A16W4_GFX942_W_LDS", "0") == "1"
+
+
 @lru_cache(maxsize=256)
 def _gluon_engaged_once(n, k, config_items):
     # overlay-only engagement marker (patches/002-moe-a16w4-gfx942-gluon-dequant): one line per shape in the server log
@@ -571,7 +577,7 @@ def moe_gemm_a16w4(
     # launch kernel
     if backend == "gluon" and get_arch() == "gfx942":
         _gluon_engaged_once(N, K, tuple(sorted(config.items())))
-        load_x, load_w, load_s, mfma_layout = _gfx942_layouts_cached(
+        load_x, load_w, load_s, mfma_layout, load_w_coal = _gfx942_layouts_cached(
             config["block_m"], config["block_n"], config["block_k"], config["num_warps"]
         )
         _moe_gemm_a16w4_gluon_gfx942[(grid,)](
@@ -622,6 +628,8 @@ def moe_gemm_a16w4(
             LOAD_W=load_w,
             LOAD_S=load_s,
             MFMA_LAYOUT=mfma_layout,
+            LOAD_W_COAL=load_w_coal,
+            W_VIA_LDS=_GFX942_W_VIA_LDS,
             UPCAST_INDICES=should_upcast_indices(x, w, y),
             num_warps=config["num_warps"],
             num_stages=config["num_stages"],
