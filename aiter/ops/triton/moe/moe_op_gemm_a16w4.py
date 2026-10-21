@@ -7,6 +7,12 @@ from functools import lru_cache
 import torch
 import triton
 
+from aiter.ops.triton._gluon_kernels.gfx942.moe.moe_op_gemm_a16w4 import (
+    _moe_gemm_a16w4_gfx942 as _moe_gemm_a16w4_gluon_gfx942,
+)
+from aiter.ops.triton._gluon_kernels.gfx942.moe.moe_op_gemm_a16w4 import (
+    gfx942_a16w4_layouts,
+)
 from aiter.ops.triton._gluon_kernels.gfx950.moe.moe_op_gemm_a16w4 import (
     _moe_gemm_a16w4_swizzle as _moe_gemm_a16w4_gluon_gfx950_swizzle,
 )
@@ -26,7 +32,7 @@ from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
 
-_GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx950")
+_GLUON_SUPPORTED_ARCHS = ("gfx1250", "gfx950", "gfx942")
 
 
 @lru_cache(maxsize=1)
@@ -272,6 +278,73 @@ def get_kernel_config_gluon_gfx950(m, n, k, routing_data):
     return ret
 
 
+def get_kernel_config_gluon_gfx942(m, n, k, routing_data):
+    """Configs for the gfx942 Gluon kernel (v_perm byte-LUT dequant, see
+    _gluon_kernels/gfx942/moe/moe_op_gemm_a16w4.py). The whole BLOCK_K x BLOCK_N bf16
+    B operand is dequantised into VGPRs, so BLOCK_K shrinks as BLOCK_M grows."""
+    block_m = routing_data.block_m
+    group_m = 4
+    num_xcds = 8
+    xcd_swizzle = num_xcds
+    w_cache_modifier = ".cg" if block_m <= 32 else None
+    num_stages = 1
+    split_k = 1
+
+    if block_m == 16:
+        block_n = 128
+        block_k = 256
+        num_warps = 4
+        grid_m = routing_data.n_blocks(m, block_m)
+        grid_n = triton.cdiv(n, block_n)
+        grid = grid_m * grid_n * split_k
+        while block_n > 16 * num_warps and grid < 256:
+            block_n = block_n // 2
+            grid_m = routing_data.n_blocks(m, block_m)
+            grid_n = triton.cdiv(n, block_n)
+            grid = grid_m * grid_n * split_k
+    elif block_m == 32:
+        block_n = 128
+        block_k = 256
+        num_warps = 4
+    elif block_m == 64:
+        block_n = 128
+        block_k = 128
+        num_warps = 8
+    else:
+        block_n = 256
+        block_k = 128
+        num_warps = 8
+
+    return {
+        "block_m": block_m,
+        "block_n": block_n,
+        "block_k": block_k,
+        "num_warps": num_warps,
+        "num_stages": num_stages,
+        "group_m": group_m,
+        "xcd_swizzle": xcd_swizzle,
+        "w_cache_modifier": w_cache_modifier,
+        "split_k": split_k,
+        "waves_per_eu": 0,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+    }
+
+
+@lru_cache(maxsize=256)
+def _gluon_engaged_once(n, k, config_items):
+    # overlay-only engagement marker (patches/002-moe-a16w4-gfx942-gluon-dequant): one line per shape in the server log
+    import sys as _s
+    config = dict(config_items)
+    cfg = {kk: config[kk] for kk in ("block_m", "block_n", "block_k", "num_warps")}
+    print(f"[moe-gluon-a16w4] ENGAGED _moe_gemm_a16w4_gfx942 key=(n={n},k={k},block_m={config['block_m']}) cfg={cfg}", file=_s.stderr, flush=True)
+
+
+@lru_cache(maxsize=64)
+def _gfx942_layouts_cached(block_m, block_n, block_k, num_warps):
+    return gfx942_a16w4_layouts(block_m, block_n, block_k, num_warps)
+
+
 def get_kernel_config_gluon_gfx1250(m, n, k, routing_data):
     block_m = routing_data.block_m
     group_m = 4
@@ -419,6 +492,17 @@ def moe_gemm_a16w4(
 
         if get_arch() == "gfx1250":
             config = get_kernel_config_gluon_gfx1250(M, N, K, routing_data)
+        elif get_arch() == "gfx942":
+            # Gluon kernel: linear (unswizzled) e8m0 scales, K-contiguous fp4 weights,
+            # K a multiple of the tile; everything else goes to the Triton kernel.
+            config = None
+            if swizzle_mx_scale is None and w.stride(-2) == 1 and K % 128 == 0:
+                config = get_kernel_config_gluon_gfx942(M, N, K, routing_data)
+                if config is not None and K % (config["block_k"] * config["split_k"]) != 0:
+                    config = None
+            if config is None:
+                backend = "triton"
+                config = get_kernel_config_triton(M, N, K, routing_data)
         elif get_arch() == "gfx950":
             # Currently on gfx950, gluon kernels requires that swizzling is enabled
             # and K % 256 == 0. Otherwise, fallback to Triton
@@ -485,7 +569,65 @@ def moe_gemm_a16w4(
     grid = grid_m * grid_n * config["split_k"]
 
     # launch kernel
-    if backend == "gluon":
+    if backend == "gluon" and get_arch() == "gfx942":
+        _gluon_engaged_once(N, K, tuple(sorted(config.items())))
+        load_x, load_w, load_s, mfma_layout = _gfx942_layouts_cached(
+            config["block_m"], config["block_n"], config["block_k"], config["num_warps"]
+        )
+        _moe_gemm_a16w4_gluon_gfx942[(grid,)](
+            y,
+            y.stride(0),
+            y.stride(1),
+            y.stride(2),
+            x,
+            x.stride(0),
+            x.stride(1),
+            w,
+            w.stride(0),
+            w.stride(1),
+            w.stride(2),
+            w_scales,
+            w_scales.stride(0),
+            w_scales.stride(1),
+            w_scales.stride(2),
+            bias,
+            stride_bias,
+            gammas,
+            N,
+            K,
+            gather_indx,
+            expt_hist,
+            expt_token_offs_raw,
+            expt_hist_sum,
+            expt_block_pid_map,
+            None,
+            grid_m,
+            grid_n,
+            apply_swiglu_matmul,
+            alpha,
+            limit,
+            reduction_n_matmul,
+            swiglu_add_residual,
+            routing_data.n_expts_act,
+            False,
+            config["block_m"],
+            config["block_n"],
+            config["block_k"],
+            config["group_m"],
+            XCD_SWIZZLE=config["xcd_swizzle"],
+            SPLIT_K=config["split_k"],
+            W_CACHE_MODIFIER=config["w_cache_modifier"],
+            SCALE_K_CONTIG=w_scales.stride(1) == 1,
+            LOAD_X=load_x,
+            LOAD_W=load_w,
+            LOAD_S=load_s,
+            MFMA_LAYOUT=mfma_layout,
+            UPCAST_INDICES=should_upcast_indices(x, w, y),
+            num_warps=config["num_warps"],
+            num_stages=config["num_stages"],
+            waves_per_eu=config["waves_per_eu"],
+        )
+    elif backend == "gluon":
         if get_arch() == "gfx1250":
             _moe_gemm_a16w4_gluon[(grid,)](
                 y,
