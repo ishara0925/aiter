@@ -2,6 +2,7 @@
 # original code https://github.com/triton-lang/triton/blob/main/python/triton_kernels/triton_kernels/matmul_details/_matmul.py
 
 import itertools
+import os
 from functools import lru_cache
 
 import torch
